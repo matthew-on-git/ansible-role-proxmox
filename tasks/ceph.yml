@@ -10,6 +10,17 @@
       args:
         creates: /etc/ceph/ceph.conf
 
+    - name: Enable IPv6 binding in Ceph config
+      community.general.ini_file:
+        path: /etc/pve/ceph.conf
+        section: global
+        option: ms_bind_ipv6
+        value: true
+        mode: '0644'
+      run_once: true
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      when: pve_ceph_ipv6_enabled | default(false)
+
     - name: Create initial Ceph monitor
       command: 'pveceph mon create'
       args:

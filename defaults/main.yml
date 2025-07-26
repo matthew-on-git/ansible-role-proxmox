@@ -30,6 +30,7 @@ pve_zfs_create_volumes: []
 pve_ceph_enabled: false
 pve_ceph_repository_line: "deb http://download.proxmox.com/debian/ceph-{{ pve_ceph_default_version }} {{ ansible_distribution_release }} {{ pve_ceph_debian_component }}"
 pve_ceph_network: "{{ (ansible_default_ipv4.network +'/'+ ansible_default_ipv4.netmask) | ansible.utils.ipaddr('net') }}"
+pve_ceph_ipv6_enabled: false
 pve_ceph_nodes: "{{ pve_group }}"
 pve_ceph_mon_group: "{{ pve_group }}"
 pve_ceph_mgr_group: "{{ pve_ceph_mon_group }}"
