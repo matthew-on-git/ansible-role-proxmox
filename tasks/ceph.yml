@@ -2,40 +2,94 @@
 ---
 
 - block:
+    - name: Remove existing Ceph config for fresh start
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      run_once: true
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      loop:
+        - /etc/pve/ceph.conf
+        - /etc/ceph/ceph.conf
+        - /etc/pve/priv/ceph.client.admin.keyring
+      when: pve_ceph_force_init | default(false)
+
     - name: Create initial Ceph config
       command: "pveceph init --network {{ pve_ceph_network }}  \
-               {% if pve_ceph_cluster_network is defined  %} \
+               {% if pve_ceph_cluster_network is defined %} \
                   --cluster-network {{ pve_ceph_cluster_network }}
                {% endif %}"
       args:
         creates: /etc/ceph/ceph.conf
 
     - name: Enable IPv6 binding in Ceph config
-      ansible.builtin.command:
-        cmd: |
-          grep -q '^ms_bind_ipv6 = true' /etc/pve/ceph.conf || echo 'ms_bind_ipv6 = true' >> /etc/pve/ceph.conf
-        creates: /etc/pve/ceph.conf
+      ansible.builtin.shell:
+        cmd: grep -q '^ms_bind_ipv6 = true' /etc/pve/ceph.conf || sed -i '/\[global\]/a ms_bind_ipv6 = true' /etc/pve/ceph.conf
       run_once: true
       delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
       when: pve_ceph_ipv6_enabled | default(false)
+      changed_when: false
+
+    - name: Remove existing initial mon directory for fresh start
+      ansible.builtin.file:
+        path: /var/lib/ceph/mon/ceph-{{ ansible_hostname }}
+        state: absent
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      when: pve_ceph_force_init | default(false)
+
+    - name: Manually bootstrap initial mon directory
+      ansible.builtin.command:
+        cmd: ceph-mon -i {{ ansible_hostname }} --mkfs --keyring /etc/pve/priv/ceph.client.admin.keyring
+      args:
+        creates: '/var/lib/ceph/mon/ceph-{{ ansible_hostname }}/done'
+      register: _ceph_mkfs
+      when: inventory_hostname == groups[pve_ceph_mon_group][0]
+
+    - name: Get monmap
+      ansible.builtin.command:
+        cmd: ceph-mon -i {{ ansible_hostname }} --extract-monmap monmap.bin
+      args:
+        creates: monmap.bin
+      run_once: true
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      when: inventory_hostname == groups[pve_ceph_mon_group][0] and _ceph_mkfs.changed
+
+    - name: Add mon to monmap
+      ansible.builtin.command:
+        cmd: monmaptool --add {{ ansible_hostname }} {{ ansible_default_ipv4.address }}:3300 monmap.bin
+      run_once: true
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      when: inventory_hostname == groups[pve_ceph_mon_group][0] and _ceph_mkfs.changed
+
+    - name: Inject monmap
+      ansible.builtin.command:
+        cmd: ceph-mon -i {{ ansible_hostname }} --inject-monmap monmap.bin
+      run_once: true
+      delegate_to: "{{ groups[pve_ceph_mon_group][0] }}"
+      when: inventory_hostname == groups[pve_ceph_mon_group][0] and _ceph_mkfs.changed
+
+    - name: Start initial Ceph mon service
+      ansible.builtin.service:
+        name: ceph-mon@{{ ansible_hostname }}
+        state: started
+      when: inventory_hostname == groups[pve_ceph_mon_group][0] and _ceph_mkfs.changed
 
     - name: Create initial Ceph monitor
-      command: 'pveceph mon create'
-      args:
-        creates: '/var/lib/ceph/mon/ceph-{{ ansible_hostname }}/'
+      command: 'pveceph createmon --mon-address {{ ansible_default_ipv4.address }}'
       register: _ceph_initial_mon
+      when: inventory_hostname == groups[pve_ceph_mon_group][0]
 
     - name: Fail if initial monitor creation failed
       fail:
-        msg: 'Ceph intial monitor creation failed.'
+        msg: 'Ceph initial monitor creation failed.'
       when: _ceph_initial_mon is failed
   when: "inventory_hostname == groups[pve_ceph_mon_group][0]"
 
 - name: Create additional Ceph monitors
-  command: 'pveceph mon create'
+  command: 'pveceph mon create --mon-address {{ ansible_default_ipv4.address }}'
   args:
-    creates: '/var/lib/ceph/mon/ceph-{{ ansible_hostname }}/'
-  when: 
+    creates: '/var/lib/ceph/mon/ceph-{{ ansible_hostname }}/done'
+  when:
   - "inventory_hostname != groups[pve_ceph_mon_group][0]"
   - "inventory_hostname in groups[pve_ceph_mon_group]"
 
@@ -53,7 +107,7 @@
 
     - name: Generate a list of active OSDs
       ansible.builtin.set_fact:
-        _existing_ceph_osds: "{{ _ceph_volume_data.stdout | from_json | json_query('*[].devices[]') | default([]) }}"
+        _existing_ceph_osds: "{{ _ceph_volume_data.stdout | from_json | json_query('*[].devices[]') | default([]) }}"
 
     - name: Generate list of unprovisioned OSDs
       ansible.builtin.set_fact:
@@ -250,7 +304,7 @@
   mount:
     path: '{{ item.mountpoint }}'
     src: |-
-      {% for h in groups[pve_ceph_mon_group] -%}
+      {% for h in groups[pve_ceph_mon_group] -%} 
       {{ hostvars[h].ansible_all_ipv4_addresses | ansible.utils.ipaddr(pve_ceph_network) | first -}}
       {{ loop.last | ternary("", ",") -}}
       {% endfor %}:/
